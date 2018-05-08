@@ -162,6 +162,12 @@ v_U8_t ccpRSNOui08[ HDD_RSN_OUI_SIZE ] = { 0x00, 0x0F, 0xAC, 0x05 };
 
 /* The time after add bss, in which SAP should start ECSA to move to SCC */
 #define ECSA_SCC_CHAN_CHANGE_DEFER_INTERVAL 1500
+/*
+ * Time in ms after disconnect, in which the SAP should move to non DFS channel.
+ * This will avoid multiple SAP channel switch if disconnet is followed by
+ * connect.
+ */
+#define ECSA_DFS_CHAN_CHANGE_DEFER_TIME 200
 
 #ifdef WLAN_FEATURE_11W
 void hdd_indicateUnprotMgmtFrame(hdd_adapter_t *pAdapter,
@@ -795,6 +801,9 @@ static void hdd_save_bss_info(hdd_adapter_t *adapter,
     } else {
         hdd_sta_ctx->conn_info.conn_flag.vht_op_present = false;
     }
+    /* Cache last connection info */
+    vos_mem_copy(&hdd_sta_ctx->cache_conn_info, &hdd_sta_ctx->conn_info,
+                 sizeof(connection_info_t));
 }
 
 void hdd_connSaveConnectInfo( hdd_adapter_t *pAdapter, tCsrRoamInfo *pRoamInfo, eCsrRoamBssType eBssType )
@@ -1598,18 +1607,24 @@ static void hdd_check_and_move_if_sap_is_on_dfs_chan(hdd_context_t *hdd_ctx,
             return;
         }
 
+        if (sap_ctx->sapsMachine != eSAP_STARTED) {
+            hddLog(LOG1, FL("SAP is not in eSAP_STARTED state"));
+            return;
+        }
+
         chan_state = vos_nv_getChannelEnabledState(sap_ctx->channel);
 
         hddLog(LOG1, "SAP is operating on channel (%hu), chan_state %d",
                 sap_ctx->channel, chan_state);
-
         if (vos_nv_getChannelEnabledState(sap_ctx->channel) !=
                 NV_CHANNEL_DFS) {
             hddLog(LOG1, "SAP is on non DFS channel. nothing to do");
             return;
         }
+
         hddLog(LOG1, "Schedule workqueue to move the SAP to non DFS channel");
-        schedule_delayed_work(&hdd_ctx->ecsa_chan_change_work, 0);
+        schedule_delayed_work(&hdd_ctx->ecsa_chan_change_work,
+                            msecs_to_jiffies(ECSA_DFS_CHAN_CHANGE_DEFER_TIME));
     }
 }
 
@@ -2027,7 +2042,6 @@ static VOS_STATUS hdd_roamRegisterSTA( hdd_adapter_t *pAdapter,
    staDesc.ucIsEseSta = pRoamInfo->isESEAssoc;
 #endif //FEATURE_WLAN_ESE
 
-#ifdef VOLANS_ENABLE_SW_REPLAY_CHECK
    /* check whether replay check is valid for the station or not */
    if( (eCSR_ENCRYPT_TYPE_TKIP == connectedCipherAlgo) || (eCSR_ENCRYPT_TYPE_AES == connectedCipherAlgo))
    {
@@ -2038,7 +2052,6 @@ static VOS_STATUS hdd_roamRegisterSTA( hdd_adapter_t *pAdapter,
        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
                  "HDD register TL ucIsReplayCheckValid %d: Replay check is needed for station", staDesc.ucIsReplayCheckValid);
    }
-
    else
    {
       /* For other encryption modes replay check is
@@ -2047,7 +2060,6 @@ static VOS_STATUS hdd_roamRegisterSTA( hdd_adapter_t *pAdapter,
         VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
                  "HDD register TL ucIsReplayCheckValid %d", staDesc.ucIsReplayCheckValid);
    }
-#endif
 
 #ifdef FEATURE_WLAN_WAPI
    hddLog(LOG1, "%s: WAPI STA Registered: %d", __func__, pAdapter->wapi_info.fIsWapiSta);
@@ -2795,7 +2807,7 @@ static eHalStatus hdd_AssociationCompletionHandler( hdd_adapter_t *pAdapter, tCs
                 hddLog(VOS_TRACE_LEVEL_INFO,"Restart Sap as SAP channel is %d "
                        "and STA channel is %d", pHostapdAdapter->sessionCtx.ap.operatingChannel,
                        (int)pRoamInfo->pBssDesc->channelId);
-                if (pHddCtx->cfg_ini->force_scc_with_ecsa)
+                if (pHddCtx->cfg_ini && pHddCtx->cfg_ini->force_scc_with_ecsa)
                 {
                     hdd_schedule_ecsa_chan_change_work(pHddCtx,
                                                        pAdapter->sessionId);
@@ -2803,13 +2815,18 @@ static eHalStatus hdd_AssociationCompletionHandler( hdd_adapter_t *pAdapter, tCs
                 else
                 {
                     hdd_hostapd_stop(pHostapdAdapter->dev);
-                    if (pHddCtx->cfg_ini->enable_sap_auth_offload)
+                    if (pHddCtx->cfg_ini &&
+                        pHddCtx->cfg_ini->enable_sap_auth_offload)
                        hdd_force_scc_restart_sap(pHostapdAdapter,
                              pHddCtx, (int)pRoamInfo->pBssDesc->channelId);
                 }
 
              }
         }
+    }
+    else if (roamStatus == eCSR_ROAM_ASSOCIATION_FAILURE)
+    {
+        hdd_check_and_move_if_sap_is_on_dfs_chan(pHddCtx, pAdapter);
     }
     return eHAL_STATUS_SUCCESS;
 }
@@ -3565,12 +3582,10 @@ VOS_STATUS hdd_roamRegisterTDLSSTA(hdd_adapter_t *pAdapter,
     /* tdls Direct Link do not need bcastSig */
     staDesc.ucBcastSig  = 0 ;
 
-#ifdef VOLANS_ENABLE_SW_REPLAY_CHECK
     if(staDesc.ucProtectedFrame)
         staDesc.ucIsReplayCheckValid = VOS_TRUE;
     else
         staDesc.ucIsReplayCheckValid = VOS_FALSE;
-#endif
 
     staDesc.ucInitState = WLANTL_STA_CONNECTED ;
 
